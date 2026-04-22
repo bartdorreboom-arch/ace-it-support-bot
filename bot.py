@@ -2,9 +2,9 @@
 ACE IT Support Bot
 ------------------
 A real-time Slack bot that:
-- Listens to #ace-it-support for new questions
+- Listens to #ace-it-support for new questions AND follow-up questions in threads
 - Searches Notion KB for relevant existing articles before answering
-- Answers questions using Claude AI
+- Combines KB knowledge with Claude AI for the best possible answer
 - Automatically creates a Notion KB article after every answered question
 
 Requirements: pip install slack_bolt anthropic notion-client
@@ -38,83 +38,140 @@ def get_bot_user_id():
     BOT_USER_ID = result["user_id"]
     log.info(f"Bot user ID: {BOT_USER_ID}")
 
-# ── Main: handle new channel messages ──────────────────────────────────────
+# ── Main: handle all messages (new questions + thread follow-ups) ──────────
 @app.event("message")
 def handle_message(event, client):
-    # Skip bot messages, edits, deletes, and thread replies
+    # Skip bot messages, edits, deletes
     if event.get("bot_id"):
         return
     if event.get("subtype") in ("message_changed", "message_deleted", "bot_message"):
         return
-    if event.get("thread_ts") and event["thread_ts"] != event["ts"]:
-        return  # Ignore replies — only respond to new top-level questions
 
-    channel_id = event["channel"]
-    thread_ts  = event["ts"]
     user_id    = event.get("user", "")
     text       = event.get("text", "").strip()
+    channel_id = event["channel"]
 
     if not text or user_id == BOT_USER_ID:
         return
 
-    log.info(f"New question from {user_id}: {text[:80]}...")
+    is_thread_reply = event.get("thread_ts") and event["thread_ts"] != event["ts"]
 
-    # 1. Search Notion KB for relevant existing articles
-    kb_context = search_notion_kb(text)
-    if kb_context:
-        log.info("Found relevant KB articles, using as context")
-    else:
-        log.info("No relevant KB articles found, answering from scratch")
+    if is_thread_reply:
+        # Follow-up question in an existing thread
+        thread_ts = event["thread_ts"]
 
-    # 2. Generate answer with Claude
-    answer = ask_claude(question=text, kb_context=kb_context, user_id=user_id)
+        # Fetch thread history so Claude has full context
+        thread = client.conversations_replies(
+            channel=channel_id,
+            ts=thread_ts
+        )
+        thread_messages = thread.get("messages", [])
 
-    # 3. Post reply in thread
-    client.chat_postMessage(
-        channel=channel_id,
-        thread_ts=thread_ts,
-        text=answer
-    )
-    log.info(f"Replied to thread {thread_ts}")
+        # Only respond if the bot was involved in this thread before
+        bot_was_here = any(m.get("user") == BOT_USER_ID for m in thread_messages)
+        if not bot_was_here:
+            return
 
-    # 4. Always create a KB article automatically
-    try:
-        notion_url = create_notion_article(
+        log.info(f"Follow-up question from {user_id} in thread {thread_ts}: {text[:80]}...")
+
+        # Build conversation history for Claude
+        history = build_thread_history(thread_messages)
+
+        # Search KB for context
+        kb_context = search_notion_kb(text)
+
+        # Answer with full thread context
+        answer = ask_claude_with_history(
             question=text,
-            answer=answer,
+            history=history,
+            kb_context=kb_context,
             user_id=user_id
         )
-        log.info(f"KB article created: {notion_url}")
 
-        # Notify Bart via DM so he stays informed and can correct if needed
         client.chat_postMessage(
-            channel=BART_USER_ID,
-            text=(
-                f"📚 Nieuw kennisbankartikel aangemaakt op basis van een vraag in *#ace-it-support*\n\n"
-                f"*Vraag:* {text[:200]}{'...' if len(text) > 200 else ''}\n\n"
-                f"*Artikel:* {notion_url}\n\n"
-                f"_Pas het artikel aan als het antwoord niet klopt._"
-            )
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=answer
         )
-    except Exception as e:
-        log.error(f"Failed to create KB article: {e}")
+        log.info(f"Replied to follow-up in thread {thread_ts}")
+
+    else:
+        # New top-level question
+        thread_ts = event["ts"]
+        log.info(f"New question from {user_id}: {text[:80]}...")
+
+        # Search KB for relevant existing articles
+        kb_context = search_notion_kb(text)
+        if kb_context:
+            log.info("Found relevant KB articles, combining with AI answer")
+        else:
+            log.info("No relevant KB articles found, answering from scratch")
+
+        # Generate answer combining KB + Claude
+        answer = ask_claude(question=text, kb_context=kb_context, user_id=user_id)
+
+        # Post reply in thread
+        client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=answer
+        )
+        log.info(f"Replied to thread {thread_ts}")
+
+        # Always create a KB article automatically
+        try:
+            notion_url = create_notion_article(
+                question=text,
+                answer=answer,
+                user_id=user_id
+            )
+            log.info(f"KB article created: {notion_url}")
+
+            # Notify Bart via DM so he stays informed and can correct if needed
+            client.chat_postMessage(
+                channel=BART_USER_ID,
+                text=(
+                    f"📚 Nieuw kennisbankartikel aangemaakt op basis van een vraag in *#ace-it-support*\n\n"
+                    f"*Vraag:* {text[:200]}{'...' if len(text) > 200 else ''}\n\n"
+                    f"*Artikel:* {notion_url}\n\n"
+                    f"_Pas het artikel aan als het antwoord niet klopt._"
+                )
+            )
+        except Exception as e:
+            log.error(f"Failed to create KB article: {e}")
 
 
-# ── Claude: generate an IT support answer ─────────────────────────────────
+# ── Build thread history for follow-up context ─────────────────────────────
+def build_thread_history(messages: list) -> list:
+    """Convert Slack thread messages to Claude conversation format."""
+    history = []
+    for msg in messages:
+        msg_user = msg.get("user", "")
+        msg_text = msg.get("text", "").strip()
+        if not msg_text:
+            continue
+        if msg_user == BOT_USER_ID:
+            history.append({"role": "assistant", "content": msg_text})
+        else:
+            history.append({"role": "user", "content": msg_text})
+    return history
+
+
+# ── Claude: answer a new question, combining KB + AI ──────────────────────
 def ask_claude(question: str, kb_context: str, user_id: str) -> str:
     system_prompt = """Je bent een vriendelijke en kundige IT-supportbot voor ACE, een creatief bureau in Nederland.
 Je beantwoordt vragen van collega's in #ace-it-support.
 
 Richtlijnen:
 - Antwoord altijd in dezelfde taal als de vraag (Nederlands of Engels)
+- Als er relevante kennisbank artikelen beschikbaar zijn, gebruik die dan als basis voor je antwoord en combineer ze met je eigen kennis
 - Wees beknopt maar volledig — geen onnodige uitweidingen
 - Geef concrete stappen als dat relevant is
 - Als je het antwoord niet weet, zeg dat eerlijk en stel voor om contact op te nemen met IT via IT@ace.nl
-- Als er relevante KB-artikelen zijn, baseer je antwoord daarop
 - Toon empathie — IT-problemen zijn frustrerend"""
 
-    user_prompt = f"""Relevante kennisbank artikelen:
-{kb_context if kb_context else "Geen relevante artikelen gevonden."}
+    user_prompt = f"""Relevante kennisbank artikelen (gebruik deze als basis voor je antwoord):
+{kb_context if kb_context else "Geen relevante artikelen gevonden — beantwoord op basis van je eigen kennis."}
 
 Vraag van <@{user_id}>:
 {question}"""
@@ -124,6 +181,41 @@ Vraag van <@{user_id}>:
         max_tokens=600,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}]
+    )
+    return response.content[0].text
+
+
+# ── Claude: answer a follow-up question with full thread history ───────────
+def ask_claude_with_history(question: str, history: list, kb_context: str, user_id: str) -> str:
+    system_prompt = """Je bent een vriendelijke en kundige IT-supportbot voor ACE, een creatief bureau in Nederland.
+Je beantwoordt vragen van collega's in #ace-it-support.
+
+Je hebt de volledige gespreksgeschiedenis van de thread beschikbaar. Gebruik die context om de vervolgvraag goed te beantwoorden.
+
+Richtlijnen:
+- Antwoord altijd in dezelfde taal als de vraag (Nederlands of Engels)
+- Gebruik de gespreksgeschiedenis als context — herhaal niet wat al gezegd is
+- Als er relevante kennisbank artikelen zijn, gebruik die dan als aanvulling
+- Wees beknopt maar volledig
+- Als je het antwoord niet weet, verwijs naar IT@ace.nl"""
+
+    # Add KB context to the last user message if available
+    final_question = question
+    if kb_context:
+        final_question = f"{question}\n\n[Relevante KB artikelen: {kb_context[:500]}]"
+
+    # Replace last user message with enriched version
+    messages = history[:-1] + [{"role": "user", "content": final_question}]
+
+    # Ensure conversation starts with user message
+    if not messages or messages[0]["role"] != "user":
+        messages = [{"role": "user", "content": final_question}]
+
+    response = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=600,
+        system=system_prompt,
+        messages=messages
     )
     return response.content[0].text
 
@@ -138,20 +230,26 @@ def search_notion_kb(query: str) -> str:
         )
         articles = []
         for page in results.get("results", []):
-            title_prop = page.get("properties", {}).get("title", {})
+            # Only include pages from our KB database
+            parent = page.get("parent", {})
+            if parent.get("database_id", "").replace("-", "") != NOTION_DB_ID.replace("-", ""):
+                continue
+
+            title_prop = page.get("properties", {}).get("Naam", {}) or page.get("properties", {}).get("title", {})
             title_items = title_prop.get("title", [])
             title = "".join(t.get("plain_text", "") for t in title_items) if title_items else "Geen titel"
 
-            # Get page content (first 500 chars)
-            blocks = notion.blocks.children.list(block_id=page["id"], page_size=5)
+            # Get page content
+            blocks = notion.blocks.children.list(block_id=page["id"], page_size=10)
             content_parts = []
             for block in blocks.get("results", []):
                 block_type = block.get("type")
                 rich_text = block.get(block_type, {}).get("rich_text", [])
                 content_parts.append("".join(t.get("plain_text", "") for t in rich_text))
 
-            content = " ".join(content_parts)[:500]
-            articles.append(f"**{title}**\n{content}")
+            content = " ".join(content_parts)[:800]
+            if title or content:
+                articles.append(f"**{title}**\n{content}")
 
         return "\n\n---\n\n".join(articles) if articles else ""
     except Exception as e:
@@ -161,7 +259,6 @@ def search_notion_kb(query: str) -> str:
 
 # ── Notion: create a KB article from question + answer ────────────────────
 def create_notion_article(question: str, answer: str, user_id: str) -> str:
-    # Ask Claude to write a clean KB article based on the Q&A
     summary_prompt = f"""Maak een beknopt kennisbankartikel op basis van deze vraag en het antwoord.
 
 Vraag: {question}
@@ -185,14 +282,12 @@ Gebruik exact dit formaat (schrijf alleen de inhoud, geen extra uitleg):
     )
     article_body = summary_response.content[0].text
 
-    # Use the question as the title (truncated)
     title = question[:80] if len(question) <= 80 else question[:77] + "..."
 
-    # Create page in Notion
     page = notion.pages.create(
         parent={"database_id": NOTION_DB_ID},
         properties={
-            "title": {
+            "Naam": {
                 "title": [{"type": "text", "text": {"content": title}}]
             }
         },
