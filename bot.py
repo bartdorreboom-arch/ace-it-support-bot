@@ -3,15 +3,14 @@ ACE IT Support Bot
 ------------------
 A real-time Slack bot that:
 - Listens to #ace-it-support for new questions
-- Answers them using Claude AI + Notion knowledge base
-- DMs Bart when a thread is resolved to ask about saving a KB article
-- Creates Notion KB articles on approval
+- Searches Notion KB for relevant existing articles before answering
+- Answers questions using Claude AI
+- Automatically creates a Notion KB article after every answered question
 
 Requirements: pip install slack_bolt anthropic notion-client
 """
 
 import os
-import json
 import logging
 from anthropic import Anthropic
 from slack_bolt import App
@@ -28,19 +27,11 @@ claude = Anthropic()
 notion = NotionClient(auth=os.environ["NOTION_API_KEY"])
 
 # ── Config ─────────────────────────────────────────────────────────────────
-CHANNEL_NAME   = "ace-it-support"
-BART_USER_ID   = "U09LUJUF7PG"          # Bart Dorreboom — IT admin
-NOTION_DB_ID   = os.environ["NOTION_DB_ID"]
-BOT_USER_ID    = None                   # Set automatically on startup
-
-# Track threads we've asked Bart about (thread_ts → thread summary)
-pending_kb: dict[str, dict] = {}
+BART_USER_ID = "U09LUJUF7PG"   # Bart Dorreboom — IT admin
+NOTION_DB_ID = os.environ["NOTION_DB_ID"]
+BOT_USER_ID  = None             # Set automatically on startup
 
 # ── Startup: get bot's own user ID so we can ignore our own messages ───────
-@app.event("app_mention")
-def handle_mention(event, say):
-    say("👋 IT Support Bot is online!", thread_ts=event["ts"])
-
 def get_bot_user_id():
     global BOT_USER_ID
     result = app.client.auth_test()
@@ -50,15 +41,13 @@ def get_bot_user_id():
 # ── Main: handle new channel messages ──────────────────────────────────────
 @app.event("message")
 def handle_message(event, client):
-    # Skip: bot messages, edited messages, deleted messages, thread replies
+    # Skip bot messages, edits, deletes, and thread replies
     if event.get("bot_id"):
         return
     if event.get("subtype") in ("message_changed", "message_deleted", "bot_message"):
         return
     if event.get("thread_ts") and event["thread_ts"] != event["ts"]:
-        # This is a reply in a thread — check if it resolves the thread
-        handle_thread_reply(event, client)
-        return
+        return  # Ignore replies — only respond to new top-level questions
 
     channel_id = event["channel"]
     thread_ts  = event["ts"]
@@ -70,8 +59,12 @@ def handle_message(event, client):
 
     log.info(f"New question from {user_id}: {text[:80]}...")
 
-    # 1. Search Notion KB for relevant context
+    # 1. Search Notion KB for relevant existing articles
     kb_context = search_notion_kb(text)
+    if kb_context:
+        log.info("Found relevant KB articles, using as context")
+    else:
+        log.info("No relevant KB articles found, answering from scratch")
 
     # 2. Generate answer with Claude
     answer = ask_claude(question=text, kb_context=kb_context, user_id=user_id)
@@ -84,113 +77,27 @@ def handle_message(event, client):
     )
     log.info(f"Replied to thread {thread_ts}")
 
-
-def handle_thread_reply(event, client):
-    """Check if a thread reply looks like a resolution, and DM Bart if so."""
-    text    = event.get("text", "").lower()
-    user_id = event.get("user", "")
-
-    # Skip bot replies
-    if user_id == BOT_USER_ID:
-        return
-
-    # Resolution signals (Dutch + English)
-    resolved_signals = [
-        "dank", "thanks", "bedankt", "top", "gelukt", "werkt", "fixed",
-        "opgelost", "perfect", "thanks!", "great", "goed zo", "super",
-        "gevonden", "dankjewel", "awesome"
-    ]
-
-    if any(signal in text for signal in resolved_signals):
-        thread_ts  = event["thread_ts"]
-        channel_id = event["channel"]
-
-        # Don't ask twice for the same thread
-        if thread_ts in pending_kb:
-            return
-
-        # Fetch the thread to build a summary
-        thread = client.conversations_replies(
-            channel=channel_id,
-            ts=thread_ts
+    # 4. Always create a KB article automatically
+    try:
+        notion_url = create_notion_article(
+            question=text,
+            answer=answer,
+            user_id=user_id
         )
-        messages = thread.get("messages", [])
-        original_question = messages[0].get("text", "") if messages else "(onbekend)"
+        log.info(f"KB article created: {notion_url}")
 
-        # Store for later when Bart says yes
-        pending_kb[thread_ts] = {
-            "channel_id": channel_id,
-            "thread_ts": thread_ts,
-            "question": original_question,
-            "messages": messages,
-        }
-
-        # DM Bart
+        # Notify Bart via DM so he stays informed and can correct if needed
         client.chat_postMessage(
             channel=BART_USER_ID,
             text=(
-                f"✅ Het lijkt erop dat een vraag in *#ace-it-support* is opgelost!\n\n"
-                f"*Vraag:* {original_question[:200]}{'...' if len(original_question) > 200 else ''}\n\n"
-                f"Zal ik dit opslaan als een kennisbankartikel in Notion zodat collega's het makkelijk kunnen vinden? "
-                f"Antwoord met *ja* of *nee* (en voeg de thread-id toe: `{thread_ts}`)."
+                f"📚 Nieuw kennisbankartikel aangemaakt op basis van een vraag in *#ace-it-support*\n\n"
+                f"*Vraag:* {text[:200]}{'...' if len(text) > 200 else ''}\n\n"
+                f"*Artikel:* {notion_url}\n\n"
+                f"_Pas het artikel aan als het antwoord niet klopt._"
             )
         )
-        log.info(f"Sent KB prompt to Bart for thread {thread_ts}")
-
-
-# ── DM handler: Bart replies yes/no ───────────────────────────────────────
-@app.event("message")
-def handle_dm(event, client):
-    # Only listen to DMs from Bart
-    if event.get("channel_type") != "im":
-        return
-    if event.get("user") != BART_USER_ID:
-        return
-    if event.get("bot_id"):
-        return
-
-    text = event.get("text", "").lower()
-
-    # Find which thread Bart is approving — he includes the thread_ts
-    matched_thread = None
-    for thread_ts in pending_kb:
-        if thread_ts in event.get("text", ""):
-            matched_thread = thread_ts
-            break
-
-    # If only one pending thread, assume it's that one
-    if not matched_thread and len(pending_kb) == 1:
-        matched_thread = list(pending_kb.keys())[0]
-
-    if not matched_thread:
-        client.chat_postMessage(
-            channel=BART_USER_ID,
-            text="Hmm, ik kan niet bepalen over welke thread je het hebt. Kun je het thread-id meesturen?"
-        )
-        return
-
-    if any(w in text for w in ["ja", "yes", "yep", "jep", "ok", "oke", "sure"]):
-        thread_data = pending_kb.pop(matched_thread)
-        notion_url = create_notion_article(thread_data)
-        client.chat_postMessage(
-            channel=BART_USER_ID,
-            text=f"📚 Kennisbankartikel aangemaakt! {notion_url}"
-        )
-        # Also confirm in the original Slack thread
-        client.chat_postMessage(
-            channel=thread_data["channel_id"],
-            thread_ts=thread_data["thread_ts"],
-            text=f"📚 Deze oplossing is opgeslagen in onze kennisbank: {notion_url}"
-        )
-        log.info(f"Created Notion KB article for thread {matched_thread}")
-
-    elif any(w in text for w in ["nee", "no", "nope", "niet", "skip"]):
-        pending_kb.pop(matched_thread, None)
-        client.chat_postMessage(
-            channel=BART_USER_ID,
-            text="👍 Geen probleem, ik sla het niet op."
-        )
-        log.info(f"Bart declined KB article for thread {matched_thread}")
+    except Exception as e:
+        log.error(f"Failed to create KB article: {e}")
 
 
 # ── Claude: generate an IT support answer ─────────────────────────────────
@@ -203,7 +110,7 @@ Richtlijnen:
 - Wees beknopt maar volledig — geen onnodige uitweidingen
 - Geef concrete stappen als dat relevant is
 - Als je het antwoord niet weet, zeg dat eerlijk en stel voor om contact op te nemen met IT via IT@ace.nl
-- Verwijs naar bestaande KB-artikelen als die beschikbaar zijn
+- Als er relevante KB-artikelen zijn, baseer je antwoord daarop
 - Toon empathie — IT-problemen zijn frustrerend"""
 
     user_prompt = f"""Relevante kennisbank artikelen:
@@ -252,31 +159,24 @@ def search_notion_kb(query: str) -> str:
         return ""
 
 
-# ── Notion: create a KB article ────────────────────────────────────────────
-def create_notion_article(thread_data: dict) -> str:
-    question   = thread_data["question"]
-    messages   = thread_data["messages"]
+# ── Notion: create a KB article from question + answer ────────────────────
+def create_notion_article(question: str, answer: str, user_id: str) -> str:
+    # Ask Claude to write a clean KB article based on the Q&A
+    summary_prompt = f"""Maak een beknopt kennisbankartikel op basis van deze vraag en het antwoord.
 
-    # Build a clean summary with Claude
-    conversation = "\n".join(
-        f"{m.get('user', 'bot')}: {m.get('text', '')}"
-        for m in messages
-    )
-    summary_prompt = f"""Maak een beknopt kennisbankartikel op basis van dit Slack-gesprek.
+Vraag: {question}
+Antwoord: {answer}
 
-Gesprek:
-{conversation}
-
-Gebruik exact dit formaat:
+Gebruik exact dit formaat (schrijf alleen de inhoud, geen extra uitleg):
 
 ## Probleem
-[1-2 zinnen: wat was het probleem?]
+[1-2 zinnen: wat was het probleem of de vraag?]
 
 ## Oplossing
-[Duidelijke stappen of uitleg]
+[Duidelijke stappen of uitleg, gebaseerd op het antwoord]
 
 ## Notities
-[Optioneel: uitzonderingen, varianten, gerelateerde issues]"""
+[Optioneel: uitzonderingen, varianten, of gerelateerde tips]"""
 
     summary_response = claude.messages.create(
         model="claude-sonnet-4-6",
@@ -285,7 +185,7 @@ Gebruik exact dit formaat:
     )
     article_body = summary_response.content[0].text
 
-    # Create title
+    # Use the question as the title (truncated)
     title = question[:80] if len(question) <= 80 else question[:77] + "..."
 
     # Create page in Notion
@@ -307,9 +207,7 @@ Gebruik exact dit formaat:
         ]
     )
 
-    page_url = page.get("url", "https://notion.so")
-    log.info(f"Notion article created: {page_url}")
-    return page_url
+    return page.get("url", "https://notion.so")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
